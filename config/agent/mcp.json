@@ -1,12 +1,11 @@
 {
     "mcpServers": {
-        "template-mcp-server": {
-            "url": "http://localhost:5001/mcp",
-            "transport": "streamable_http",
-            "enabled": true,
-            "auth": true,
-            "ssl_verify": false,
-            "timeout": 30
+        "Dataverse MCP": {
+            "url": "https://mcp.dataverse.redhat.com/mcp/"
+        },
+        "atlassian-mcp-server": {
+            "url": "https://mcp.atlassian.com/v1/mcp/authv2",
+            "type": "http"
         }
     }
 }

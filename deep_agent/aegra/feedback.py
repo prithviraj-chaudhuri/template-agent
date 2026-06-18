@@ -75,6 +75,11 @@ register_atexit()
 
 app = FastAPI(title="template-agent-custom")
 
+# Register MCP endpoints router
+from deep_agent.aegra.mcp_endpoints import router as mcp_router
+
+app.include_router(mcp_router)
+
 
 class TraceIDMiddleware(BaseHTTPMiddleware):
     """Propagate X-Trace-ID from incoming requests into the logging context.
