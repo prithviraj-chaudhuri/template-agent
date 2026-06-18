@@ -16,18 +16,33 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 
 from deep_agent.src.agent.config import agent_config
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
 
-# In-memory storage for PKCE code_verifier values (keyed by client_id)
+# In-memory storage for OAuth sessions (keyed by server_name)
 # In production, use Redis or a database with TTL
-_PKCE_VERIFIERS: dict[str, str] = {}
+# Maps server_name → {"client_id": str, "code_verifier": str}
+_OAUTH_SESSIONS: dict[str, dict[str, str]] = {}
 
-# In-memory storage for OAuth client_id values (keyed by server_name)
-_OAUTH_CLIENTS: dict[str, str] = {}
+
+def _get_redirect_uri() -> str:
+    """Construct OAuth redirect URI from current agent settings.
+
+    Returns:
+        Complete redirect URI (e.g., http://localhost:5002/mcp/oauth/callback)
+    """
+    host = settings.AGENT_HOST
+    port = settings.AGENT_PORT
+
+    # Use localhost for 0.0.0.0 bind address
+    if host == "0.0.0.0":
+        host = "localhost"
+
+    return f"http://{host}:{port}/mcp/oauth/callback"
 
 
 async def _extract_oauth_auth_url(
@@ -38,10 +53,52 @@ async def _extract_oauth_auth_url(
     Args:
         server_url: MCP server base URL
         exc: Exception that may contain WWW-Authenticate header
+        server_name: Name of the MCP server for session tracking
 
     Returns:
         Complete OAuth authorization URL if extractable, None otherwise
     """
+    # Check if we already have an active session for this server
+    if server_name in _OAUTH_SESSIONS:
+        session = _OAUTH_SESSIONS[server_name]
+        logger.info(
+            "Reusing existing OAuth session for %s (client_id: %s)",
+            server_name,
+            session["client_id"]
+        )
+
+        # Rebuild the authorization URL with the existing client_id
+        redirect_uri = _get_redirect_uri()
+
+        # We need to regenerate PKCE since the old one might have been used
+        import base64
+        import hashlib
+        import secrets
+
+        code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
+        code_challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode('utf-8')).digest()
+        ).decode('utf-8').rstrip('=')
+
+        # Update the code_verifier in the session
+        session["code_verifier"] = code_verifier
+
+        # Return auth URL with existing client_id
+        from urllib.parse import urlencode
+        auth_url = session.get("auth_endpoint", "https://auth.atlassian.com/authorize")
+        params = {
+            "response_type": "code",
+            "client_id": session["client_id"],
+            "redirect_uri": redirect_uri,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+        scope = session.get("scope")
+        if scope:
+            params["scope"] = scope
+
+        return f"{auth_url}?{urlencode(params)}"
+
     import httpx
     from mcp.client.auth.utils import (
         extract_field_from_www_auth,
@@ -147,7 +204,8 @@ async def _extract_oauth_auth_url(
     )
 
     # Register client dynamically (RFC 7591)
-    redirect_uri = "http://localhost:8123/mcp/oauth/callback"
+    redirect_uri = _get_redirect_uri()
+    base_uri = f"http://{settings.AGENT_HOST if settings.AGENT_HOST != '0.0.0.0' else 'localhost'}:{settings.AGENT_PORT}"
 
     try:
         async with httpx.AsyncClient(verify=False) as client:  # nosec B501
@@ -155,7 +213,7 @@ async def _extract_oauth_auth_url(
                 registration_endpoint,
                 json={
                     "client_name": "Aegra Agent",
-                    "client_uri": "http://localhost:8123",
+                    "client_uri": base_uri,
                     "redirect_uris": [redirect_uri],
                     "grant_types": ["authorization_code", "refresh_token"],
                     "response_types": ["code"],
@@ -180,7 +238,7 @@ async def _extract_oauth_auth_url(
                 logger.error("No client_id in registration response")
                 return None
 
-            logger.info("Successfully registered OAuth client: %s", client_id)
+            logger.info("Successfully registered OAuth client: %s for server: %s", client_id, server_name)
 
             # Generate PKCE code_verifier and code_challenge (RFC 7636)
             code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
@@ -188,12 +246,17 @@ async def _extract_oauth_auth_url(
                 hashlib.sha256(code_verifier.encode('utf-8')).digest()
             ).decode('utf-8').rstrip('=')
 
-            # Store code_verifier for token exchange
+            # Store session data keyed by server_name (not state - UI overwrites state)
             # In production, use Redis or a database with TTL
-            _PKCE_VERIFIERS[client_id] = code_verifier
-            _OAUTH_CLIENTS[server_name] = client_id
+            _OAUTH_SESSIONS[server_name] = {
+                "client_id": client_id,
+                "code_verifier": code_verifier,
+                "auth_endpoint": str(auth_metadata.authorization_endpoint),
+                "scope": scope,
+            }
 
             # Build authorization URL with dynamically registered client_id and PKCE
+            # Don't include state - the UI will add its own for CSRF protection
             auth_endpoint = str(auth_metadata.authorization_endpoint)
             params = {
                 "response_type": "code",
@@ -338,34 +401,33 @@ async def oauth_callback(code: str, state: str | None = None) -> str:
 
     Args:
         code: Authorization code from OAuth provider
-        state: Optional state parameter for CSRF protection
+        state: Optional state parameter (used by UI for CSRF, not session tracking)
 
     Returns:
-        {"status": "success", "message": "Authentication successful"}
+        HTML success page with auto-close script
 
     Raises:
         HTTPException: 400 if code exchange fails
     """
     import httpx
 
-    # Find the server name from stored OAuth clients
-    # In a real implementation, you'd use the state parameter to track this
-    server_name = None
-    client_id = None
-
-    # For now, get the first (and likely only) OAuth client
-    if _OAUTH_CLIENTS:
-        server_name = next(iter(_OAUTH_CLIENTS.keys()))
-        client_id = _OAUTH_CLIENTS[server_name]
-
-    if not client_id or client_id not in _PKCE_VERIFIERS:
-        logger.error("No PKCE verifier found for OAuth callback")
+    # Since we can't rely on state (UI overwrites it), we need to find the session
+    # For now, assume there's only one OAuth server in progress
+    if not _OAUTH_SESSIONS:
+        logger.error("No active OAuth sessions found")
         raise HTTPException(
             status_code=400,
-            detail="OAuth session not found. Please restart the authentication flow."
+            detail="No active OAuth session found. Please restart the authentication flow."
         )
 
-    code_verifier = _PKCE_VERIFIERS[client_id]
+    # Get the first (and likely only) OAuth session
+    # In a multi-tenant setup, you'd need a better way to track this
+    server_name = next(iter(_OAUTH_SESSIONS.keys()))
+    session = _OAUTH_SESSIONS[server_name]
+    client_id = session["client_id"]
+    code_verifier = session["code_verifier"]
+
+    logger.info("Processing OAuth callback for server: %s, client_id: %s", server_name, client_id)
 
     # Get server config to find token endpoint
     try:
@@ -381,6 +443,8 @@ async def oauth_callback(code: str, state: str | None = None) -> str:
         token_endpoint = "https://auth.atlassian.com/oauth/token"
 
         # Exchange authorization code for access token with PKCE
+        redirect_uri = _get_redirect_uri()
+
         async with httpx.AsyncClient(verify=False) as client:  # nosec B501
             token_response = await client.post(
                 token_endpoint,
@@ -388,7 +452,7 @@ async def oauth_callback(code: str, state: str | None = None) -> str:
                     "grant_type": "authorization_code",
                     "code": code,
                     "client_id": client_id,
-                    "redirect_uri": "http://localhost:8123/mcp/oauth/callback",
+                    "redirect_uri": redirect_uri,
                     "code_verifier": code_verifier,
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -414,8 +478,8 @@ async def oauth_callback(code: str, state: str | None = None) -> str:
                 server_name
             )
 
-            # Clean up PKCE verifier
-            del _PKCE_VERIFIERS[client_id]
+            # Clean up session data
+            del _OAUTH_SESSIONS[server_name]
 
             # TODO: Store access_token and refresh_token for future use
             # For now, just return success HTML page
@@ -489,6 +553,27 @@ async def oauth_callback(code: str, state: str | None = None) -> str:
             status_code=500,
             detail=f"OAuth callback failed: {str(e)}"
         ) from e
+
+
+@router.post("/oauth/reset")
+async def reset_oauth_cache() -> dict[str, Any]:
+    """Clear OAuth client cache to force re-registration.
+
+    Use this when the redirect URI or other OAuth settings have changed.
+
+    Returns:
+        {"status": "success", "message": "OAuth cache cleared"}
+    """
+    global _OAUTH_SESSIONS
+    _OAUTH_SESSIONS.clear()
+
+    logger.info("OAuth cache cleared - clients will re-register on next connection attempt")
+
+    return {
+        "status": "success",
+        "message": "OAuth cache cleared. Refresh MCP servers to re-register.",
+        "current_redirect_uri": _get_redirect_uri()
+    }
 
 
 @router.get("/servers")
