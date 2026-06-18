@@ -25,8 +25,15 @@ router = APIRouter(prefix="/mcp", tags=["mcp"])
 
 # In-memory storage for OAuth sessions (keyed by server_name)
 # In production, use Redis or a database with TTL
-# Maps server_name → {"client_id": str, "code_verifier": str}
-_OAUTH_SESSIONS: dict[str, dict[str, str]] = {}
+# Maps server_name → {
+#   "client_id": str,
+#   "code_verifier": str,
+#   "access_token": str | None,
+#   "refresh_token": str | None,
+#   "token_expires_at": float | None,
+#   "token_endpoint": str | None,
+# }
+_OAUTH_SESSIONS: dict[str, dict[str, Any]] = {}
 
 
 def _get_redirect_uri() -> str:
@@ -45,6 +52,90 @@ def _get_redirect_uri() -> str:
     return f"http://{host}:{port}/mcp/oauth/callback"
 
 
+async def get_all_oauth_tokens() -> dict[str, str]:
+    """Get all valid OAuth access tokens for all servers.
+
+    This function is called by the agent to get tokens for MCP tool calls.
+
+    Returns:
+        Dict mapping server_name → access_token (only valid, non-expired tokens)
+    """
+    tokens = {}
+    for server_name in list(_OAUTH_SESSIONS.keys()):
+        token = await _get_valid_access_token(server_name)
+        if token:
+            tokens[server_name] = token
+    return tokens
+
+
+async def _get_valid_access_token(server_name: str) -> str | None:
+    """Get a valid access token for the server, refreshing if needed.
+
+    Args:
+        server_name: Name of the MCP server
+
+    Returns:
+        Valid access token, or None if not authenticated or refresh failed
+    """
+    import time
+    import httpx
+
+    if server_name not in _OAUTH_SESSIONS:
+        return None
+
+    session = _OAUTH_SESSIONS[server_name]
+    access_token = session.get("access_token")
+    refresh_token = session.get("refresh_token")
+    expires_at = session.get("token_expires_at", 0)
+
+    # If token is still valid (with 60s buffer), return it
+    if access_token and time.time() < (expires_at - 60):
+        logger.debug("Using cached access token for %s (expires in %.0fs)",
+                     server_name, expires_at - time.time())
+        return access_token
+
+    # Try to refresh the token
+    if refresh_token and session.get("token_endpoint"):
+        logger.info("Refreshing access token for %s", server_name)
+        try:
+            async with httpx.AsyncClient(verify=False) as client:  # nosec B501
+                token_response = await client.post(
+                    session["token_endpoint"],
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                        "client_id": session.get("client_id"),
+                    },
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+
+                if token_response.status_code == 200:
+                    token_data = token_response.json()
+                    new_access_token = token_data.get("access_token")
+                    new_refresh_token = token_data.get("refresh_token", refresh_token)
+                    expires_in = token_data.get("expires_in", 3600)
+
+                    # Update session with new tokens
+                    session["access_token"] = new_access_token
+                    session["refresh_token"] = new_refresh_token
+                    session["token_expires_at"] = time.time() + expires_in
+
+                    logger.info("Successfully refreshed access token for %s (expires in %ds)",
+                               server_name, expires_in)
+                    return new_access_token
+                else:
+                    logger.warning("Token refresh failed for %s: %s",
+                                 server_name, token_response.text)
+        except Exception as e:
+            logger.error("Token refresh error for %s: %s", server_name, e)
+
+    # Token invalid and refresh failed - clear tokens to force re-auth
+    session.pop("access_token", None)
+    session.pop("refresh_token", None)
+    session.pop("token_expires_at", None)
+    return None
+
+
 async def _extract_oauth_auth_url(
     server_url: str, exc: BaseException, server_name: str
 ) -> str | None:
@@ -58,6 +149,13 @@ async def _extract_oauth_auth_url(
     Returns:
         Complete OAuth authorization URL if extractable, None otherwise
     """
+    # Check if we have a valid token first
+    valid_token = await _get_valid_access_token(server_name)
+    if valid_token:
+        logger.info("Valid access token exists for %s - should not need new auth", server_name)
+        # Return None to indicate we shouldn't need auth (the server should retry with token)
+        return None
+
     # Check if we already have an active session for this server
     if server_name in _OAUTH_SESSIONS:
         session = _OAUTH_SESSIONS[server_name]
@@ -252,7 +350,11 @@ async def _extract_oauth_auth_url(
                 "client_id": client_id,
                 "code_verifier": code_verifier,
                 "auth_endpoint": str(auth_metadata.authorization_endpoint),
+                "token_endpoint": str(auth_metadata.token_endpoint) if auth_metadata.token_endpoint else "https://auth.atlassian.com/oauth/token",
                 "scope": scope,
+                "access_token": None,
+                "refresh_token": None,
+                "token_expires_at": None,
             }
 
             # Build authorization URL with dynamically registered client_id and PKCE
@@ -301,8 +403,8 @@ async def _get_server_capabilities(server_name: str, config: dict[str, Any]) -> 
 
         timeout = config.get("timeout", 30)
 
-        # Build client config without SSO token for discovery
-        client_config = _build_server_config(config, sso_token=None)
+        # Build client config with cached OAuth token if available
+        client_config = _build_server_config(config, sso_token=None, server_name=server_name)
 
         tools_count = 0
         prompts_count = 0
@@ -429,19 +531,10 @@ async def oauth_callback(code: str, state: str | None = None) -> str:
 
     logger.info("Processing OAuth callback for server: %s, client_id: %s", server_name, client_id)
 
-    # Get server config to find token endpoint
+    # Get token endpoint from session
+    token_endpoint = session.get("token_endpoint", "https://auth.atlassian.com/oauth/token")
+
     try:
-        servers_config = agent_config.get_mcp_servers()
-        if server_name not in servers_config:
-            raise HTTPException(status_code=400, detail="Server not found")
-
-        server_config = servers_config[server_name]
-        server_url = server_config.get("url", "")
-
-        # Discover token endpoint from OAuth metadata
-        # For Atlassian, it's https://auth.atlassian.com/oauth/token
-        token_endpoint = "https://auth.atlassian.com/oauth/token"
-
         # Exchange authorization code for access token with PKCE
         redirect_uri = _get_redirect_uri()
 
@@ -472,18 +565,19 @@ async def oauth_callback(code: str, state: str | None = None) -> str:
             token_data = token_response.json()
             access_token = token_data.get("access_token")
             refresh_token = token_data.get("refresh_token")
+            expires_in = token_data.get("expires_in", 3600)  # Default 1 hour
+
+            # Store tokens in session for future use
+            import time
+            session["access_token"] = access_token
+            session["refresh_token"] = refresh_token
+            session["token_expires_at"] = time.time() + expires_in
 
             logger.info(
-                "Successfully obtained access token for server: %s",
-                server_name
+                "Successfully obtained access token for server: %s (expires in %ds)",
+                server_name,
+                expires_in
             )
-
-            # Clean up session data
-            del _OAUTH_SESSIONS[server_name]
-
-            # TODO: Store access_token and refresh_token for future use
-            # For now, just return success HTML page
-            # In production, store these in Redis or database keyed by server_name
 
             return """
             <!DOCTYPE html>

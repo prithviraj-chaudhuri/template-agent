@@ -63,22 +63,47 @@ def set_mcp_auth_context(
 
 
 class _TokenInjectorInterceptor:
-    """Inject the current request's SSO token into every MCP tool call.
+    """Inject the current request's SSO or OAuth token into every MCP tool call.
 
-    Reads the access token from the ``_current_access_token`` ContextVar
-    (set per-request by ``set_mcp_auth_context``) and overrides the
-    ``Authorization`` header on the outgoing MCP request. This ensures
-    cached tool objects always use the correct user's token.
+    Priority:
+    1. SSO token from ContextVar (set per-request by ``set_mcp_auth_context``)
+    2. OAuth token from cached sessions (auto-refreshed if needed)
+    3. No token (anonymous/cached auth)
+
+    This ensures cached tool objects always use the correct user's token.
     """
 
     async def __call__(self, request: Any, handler: Any) -> Any:
+        # Try SSO token first (per-request context)
         access = _current_access_token.get()
         if access:
             request = request.override(headers={"Authorization": f"Bearer {access}"})
-        else:
-            logger.warning(
-                "TokenInjector: no access token in ContextVar — MCP call will use cached/anonymous auth"
-            )
+            return await handler(request)
+
+        # Try OAuth token from cached sessions
+        # Extract server name from request URL to find the right session
+        try:
+            from deep_agent.aegra.mcp_endpoints import _get_valid_access_token
+
+            # Try to extract server name from request
+            # This is a best-effort attempt - if we can't determine it, we fall back
+            request_url = str(getattr(request, 'url', ''))
+
+            # Check all cached OAuth sessions and use any valid token
+            # (In practice, there's usually only one OAuth server)
+            from deep_agent.aegra.mcp_endpoints import _OAUTH_SESSIONS
+
+            for server_name in _OAUTH_SESSIONS.keys():
+                oauth_token = await _get_valid_access_token(server_name)
+                if oauth_token:
+                    logger.debug("TokenInjector: using OAuth token for %s", server_name)
+                    request = request.override(headers={"Authorization": f"Bearer {oauth_token}"})
+                    return await handler(request)
+        except Exception as e:
+            logger.debug("TokenInjector: OAuth token lookup failed: %s", e)
+
+        # No token available - proceed with whatever auth was set at connection time
+        logger.debug("TokenInjector: no SSO or OAuth token — using connection-time auth")
         return await handler(request)
 
 
@@ -185,12 +210,14 @@ def _get_server_configs() -> dict[str, dict[str, Any]]:
 def _build_server_config(
     entry: dict[str, Any],
     sso_token: str | None,
+    server_name: str | None = None,
 ) -> dict[str, Any]:
     """Build MultiServerMCPClient config from server definition.
 
     Args:
         entry: Server definition with url, auth, ssl_verify, transport.
         sso_token: Optional bearer token (should already be refreshed).
+        server_name: Optional server name for OAuth token lookup.
 
     Returns:
         Config dict for MultiServerMCPClient.
@@ -199,8 +226,30 @@ def _build_server_config(
 
     headers: dict[str, str] = {}
 
-    # Use traditional bearer token auth
-    if entry.get("auth", True) and sso_token:
+    # Try to get OAuth token from cache first (if server_name provided)
+    oauth_token = None
+    if server_name:
+        try:
+            # Import here to avoid circular dependency
+            from deep_agent.aegra.mcp_endpoints import _OAUTH_SESSIONS
+            import time
+
+            if server_name in _OAUTH_SESSIONS:
+                session = _OAUTH_SESSIONS[server_name]
+                access_token = session.get("access_token")
+                expires_at = session.get("token_expires_at", 0)
+
+                # Use cached token if still valid (with 60s buffer)
+                if access_token and time.time() < (expires_at - 60):
+                    oauth_token = access_token
+                    logger.debug("Using cached OAuth token for %s", server_name)
+        except Exception:
+            pass  # Ignore errors, fall back to SSO token
+
+    # Use OAuth token, then SSO token, then no auth
+    if oauth_token:
+        headers["Authorization"] = f"Bearer {oauth_token}"
+    elif entry.get("auth", True) and sso_token:
         headers["Authorization"] = f"Bearer {sso_token}"
 
     trace_id = _trace_id_var.get()
@@ -374,7 +423,7 @@ async def get_mcp_tools(
         *[
             _connect_single_server(
                 name=name,
-                config=_build_server_config(entry, sso_token),
+                config=_build_server_config(entry, sso_token, server_name=name),
                 timeout=entry.get("timeout", 30),
                 required=has_auth,
             )
