@@ -81,18 +81,11 @@ class _TokenInjectorInterceptor:
             return await handler(request)
 
         # Try OAuth token from cached sessions
-        # Extract server name from request URL to find the right session
         try:
-            from deep_agent.aegra.mcp_endpoints import _get_valid_access_token
-
-            # Try to extract server name from request
-            # This is a best-effort attempt - if we can't determine it, we fall back
-            request_url = str(getattr(request, 'url', ''))
+            from deep_agent.aegra.mcp_endpoints import _get_valid_access_token, _OAUTH_SESSIONS
 
             # Check all cached OAuth sessions and use any valid token
             # (In practice, there's usually only one OAuth server)
-            from deep_agent.aegra.mcp_endpoints import _OAUTH_SESSIONS
-
             for server_name in _OAUTH_SESSIONS.keys():
                 oauth_token = await _get_valid_access_token(server_name)
                 if oauth_token:

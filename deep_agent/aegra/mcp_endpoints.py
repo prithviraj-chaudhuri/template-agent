@@ -393,10 +393,18 @@ async def _get_server_capabilities(server_name: str, config: dict[str, Any]) -> 
             "prompts": int,
             "resources": int,
             "error": str | None,
-            "auth_url": str | None  # OAuth authorization URL when needs-auth
+            "auth_url": str | None,  # OAuth authorization URL when needs-auth
+            "token_valid": bool | None  # True if cached token exists and is valid
         }
     """
     from deep_agent.aegra.mcp import _build_server_config, _is_auth_error
+
+    # Check if we have a valid cached token first
+    has_valid_token = False
+    valid_token = await _get_valid_access_token(server_name)
+    if valid_token:
+        has_valid_token = True
+        logger.info("Using cached OAuth token for server status check: %s", server_name)
 
     try:
         from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -454,6 +462,7 @@ async def _get_server_capabilities(server_name: str, config: dict[str, Any]) -> 
             "resources": resources_count,
             "error": None,
             "auth_url": None,
+            "token_valid": has_valid_token,
         }
 
     except Exception as exc:
@@ -467,8 +476,38 @@ async def _get_server_capabilities(server_name: str, config: dict[str, Any]) -> 
 
         # Detect authentication errors (401/403)
         if _is_auth_error(exc):
-            # Try to extract OAuth authorization URL
+            # Check if we have a cached token that just expired/failed
+            session = _OAUTH_SESSIONS.get(server_name)
+            token_info = None
+            if session:
+                import time
+                token_info = {
+                    "has_session": True,
+                    "has_token": bool(session.get("access_token")),
+                    "token_expired": time.time() >= session.get("token_expires_at", 0),
+                }
+
+            # Try to extract OAuth authorization URL (will skip if we already have a valid token)
             auth_url = await _extract_oauth_auth_url(config.get("url", ""), exc, server_name)
+
+            # If we have a valid cached token, this shouldn't be an auth error
+            # It might be a transient issue - return as disconnected instead
+            if has_valid_token:
+                logger.warning(
+                    "Auth error for %s despite valid token - may be transient issue",
+                    server_name
+                )
+                return {
+                    "name": server_name,
+                    "url": config.get("url", ""),
+                    "status": "disconnected",
+                    "tools": 0,
+                    "prompts": 0,
+                    "resources": 0,
+                    "error": "Connection failed (token valid but auth rejected)",
+                    "auth_url": None,
+                    "token_valid": True,
+                }
 
             return {
                 "name": server_name,
@@ -479,6 +518,7 @@ async def _get_server_capabilities(server_name: str, config: dict[str, Any]) -> 
                 "resources": 0,
                 "error": "Authentication required",
                 "auth_url": auth_url,
+                "token_valid": False,
             }
 
         # All other errors are connection failures
@@ -491,6 +531,7 @@ async def _get_server_capabilities(server_name: str, config: dict[str, Any]) -> 
             "resources": 0,
             "error": error_msg[:200],  # Truncate long error messages
             "auth_url": None,
+            "token_valid": has_valid_token,
         }
 
 
@@ -677,6 +718,12 @@ async def get_mcp_servers() -> dict[str, Any]:
     Connects to each enabled MCP server in parallel and returns their
     real-time status including tool, prompt, and resource counts.
 
+    **OAuth Token Caching:**
+    - If a server has a cached OAuth token, it will be used automatically
+    - Valid tokens result in status: "connected" with actual tool counts
+    - Expired tokens are auto-refreshed before making the connection
+    - Only shows status: "needs-auth" if no valid token is available
+
     For servers requiring OAuth authentication (status: "needs-auth"),
     the response includes an auth_url field with the OAuth authorization
     endpoint that the user should visit to complete the code flow.
@@ -692,7 +739,8 @@ async def get_mcp_servers() -> dict[str, Any]:
                     "prompts": 0,
                     "resources": 0,
                     "error": null | "error message",
-                    "auth_url": null | "https://auth.example.com/authorize?..."
+                    "auth_url": null | "https://auth.example.com/authorize?...",
+                    "token_valid": true | false | null
                 }
             ]
         }
