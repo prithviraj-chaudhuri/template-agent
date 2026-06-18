@@ -1,8 +1,5 @@
 {
     "mcpServers": {
-        "Dataverse MCP": {
-            "url": "https://mcp.dataverse.redhat.com/mcp/"
-        },
         "atlassian-mcp-server": {
             "url": "https://mcp.atlassian.com/v1/mcp/authv2",
             "type": "http"

@@ -198,6 +198,8 @@ def _build_server_config(
     from deep_agent.utils.pylogger import _trace_id_var
 
     headers: dict[str, str] = {}
+
+    # Use traditional bearer token auth
     if entry.get("auth", True) and sso_token:
         headers["Authorization"] = f"Bearer {sso_token}"
 

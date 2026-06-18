@@ -13,6 +13,7 @@ import asyncio
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import HTMLResponse
 
 from deep_agent.src.agent.config import agent_config
 from deep_agent.utils.pylogger import get_python_logger
@@ -21,9 +22,16 @@ logger = get_python_logger()
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
 
+# In-memory storage for PKCE code_verifier values (keyed by client_id)
+# In production, use Redis or a database with TTL
+_PKCE_VERIFIERS: dict[str, str] = {}
+
+# In-memory storage for OAuth client_id values (keyed by server_name)
+_OAUTH_CLIENTS: dict[str, str] = {}
+
 
 async def _extract_oauth_auth_url(
-    server_url: str, exc: BaseException
+    server_url: str, exc: BaseException, server_name: str
 ) -> str | None:
     """Extract and build OAuth authorization URL from 401 response.
 
@@ -118,8 +126,18 @@ async def _extract_oauth_auth_url(
     if not auth_metadata or not auth_metadata.authorization_endpoint:
         return None
 
-    # Build authorization URL with code flow parameters
+    # Perform dynamic client registration first
     from urllib.parse import urlencode
+    import httpx
+    import secrets
+    import hashlib
+    import base64
+
+    registration_endpoint = str(auth_metadata.registration_endpoint) if auth_metadata.registration_endpoint else None
+
+    if not registration_endpoint:
+        logger.warning("No registration endpoint found in OAuth metadata - cannot use dynamic client registration")
+        return None
 
     # Get scopes from protected resource metadata
     scope = (
@@ -128,17 +146,70 @@ async def _extract_oauth_auth_url(
         else None
     )
 
-    # Build authorization URL
-    auth_endpoint = str(auth_metadata.authorization_endpoint)
-    params = {
-        "response_type": "code",
-        "client_id": "aegra-agent",  # This should match your OAuth client registration
-        "redirect_uri": "http://localhost:8123/oauth/callback",  # Redirect endpoint
-    }
-    if scope:
-        params["scope"] = scope
+    # Register client dynamically (RFC 7591)
+    redirect_uri = "http://localhost:8123/mcp/oauth/callback"
 
-    return f"{auth_endpoint}?{urlencode(params)}"
+    try:
+        async with httpx.AsyncClient(verify=False) as client:  # nosec B501
+            registration_response = await client.post(
+                registration_endpoint,
+                json={
+                    "client_name": "Aegra Agent",
+                    "client_uri": "http://localhost:8123",
+                    "redirect_uris": [redirect_uri],
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"],
+                    "token_endpoint_auth_method": "none",  # Public client (no secret)
+                    "scope": scope,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+
+            if registration_response.status_code not in (200, 201):
+                logger.error(
+                    "Dynamic client registration failed: %s - %s",
+                    registration_response.status_code,
+                    registration_response.text
+                )
+                return None
+
+            registration_data = registration_response.json()
+            client_id = registration_data.get("client_id")
+
+            if not client_id:
+                logger.error("No client_id in registration response")
+                return None
+
+            logger.info("Successfully registered OAuth client: %s", client_id)
+
+            # Generate PKCE code_verifier and code_challenge (RFC 7636)
+            code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
+            code_challenge = base64.urlsafe_b64encode(
+                hashlib.sha256(code_verifier.encode('utf-8')).digest()
+            ).decode('utf-8').rstrip('=')
+
+            # Store code_verifier for token exchange
+            # In production, use Redis or a database with TTL
+            _PKCE_VERIFIERS[client_id] = code_verifier
+            _OAUTH_CLIENTS[server_name] = client_id
+
+            # Build authorization URL with dynamically registered client_id and PKCE
+            auth_endpoint = str(auth_metadata.authorization_endpoint)
+            params = {
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+            }
+            if scope:
+                params["scope"] = scope
+
+            return f"{auth_endpoint}?{urlencode(params)}"
+
+    except Exception as e:
+        logger.error("Failed to perform dynamic client registration: %s", e, exc_info=True)
+        return None
 
 
 async def _get_server_capabilities(server_name: str, config: dict[str, Any]) -> dict[str, Any]:
@@ -232,7 +303,7 @@ async def _get_server_capabilities(server_name: str, config: dict[str, Any]) -> 
         # Detect authentication errors (401/403)
         if _is_auth_error(exc):
             # Try to extract OAuth authorization URL
-            auth_url = await _extract_oauth_auth_url(config.get("url", ""), exc)
+            auth_url = await _extract_oauth_auth_url(config.get("url", ""), exc, server_name)
 
             return {
                 "name": server_name,
@@ -256,6 +327,168 @@ async def _get_server_capabilities(server_name: str, config: dict[str, Any]) -> 
             "error": error_msg[:200],  # Truncate long error messages
             "auth_url": None,
         }
+
+
+@router.get("/oauth/callback", response_class=HTMLResponse)
+async def oauth_callback(code: str, state: str | None = None) -> str:
+    """Handle OAuth callback after user authorization.
+
+    This endpoint receives the authorization code from the OAuth provider
+    and exchanges it for an access token using PKCE.
+
+    Args:
+        code: Authorization code from OAuth provider
+        state: Optional state parameter for CSRF protection
+
+    Returns:
+        {"status": "success", "message": "Authentication successful"}
+
+    Raises:
+        HTTPException: 400 if code exchange fails
+    """
+    import httpx
+
+    # Find the server name from stored OAuth clients
+    # In a real implementation, you'd use the state parameter to track this
+    server_name = None
+    client_id = None
+
+    # For now, get the first (and likely only) OAuth client
+    if _OAUTH_CLIENTS:
+        server_name = next(iter(_OAUTH_CLIENTS.keys()))
+        client_id = _OAUTH_CLIENTS[server_name]
+
+    if not client_id or client_id not in _PKCE_VERIFIERS:
+        logger.error("No PKCE verifier found for OAuth callback")
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth session not found. Please restart the authentication flow."
+        )
+
+    code_verifier = _PKCE_VERIFIERS[client_id]
+
+    # Get server config to find token endpoint
+    try:
+        servers_config = agent_config.get_mcp_servers()
+        if server_name not in servers_config:
+            raise HTTPException(status_code=400, detail="Server not found")
+
+        server_config = servers_config[server_name]
+        server_url = server_config.get("url", "")
+
+        # Discover token endpoint from OAuth metadata
+        # For Atlassian, it's https://auth.atlassian.com/oauth/token
+        token_endpoint = "https://auth.atlassian.com/oauth/token"
+
+        # Exchange authorization code for access token with PKCE
+        async with httpx.AsyncClient(verify=False) as client:  # nosec B501
+            token_response = await client.post(
+                token_endpoint,
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "client_id": client_id,
+                    "redirect_uri": "http://localhost:8123/mcp/oauth/callback",
+                    "code_verifier": code_verifier,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+
+            if token_response.status_code != 200:
+                logger.error(
+                    "Token exchange failed: %s - %s",
+                    token_response.status_code,
+                    token_response.text
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Token exchange failed: {token_response.text}"
+                )
+
+            token_data = token_response.json()
+            access_token = token_data.get("access_token")
+            refresh_token = token_data.get("refresh_token")
+
+            logger.info(
+                "Successfully obtained access token for server: %s",
+                server_name
+            )
+
+            # Clean up PKCE verifier
+            del _PKCE_VERIFIERS[client_id]
+
+            # TODO: Store access_token and refresh_token for future use
+            # For now, just return success HTML page
+            # In production, store these in Redis or database keyed by server_name
+
+            return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Authentication Successful</title>
+                <style>
+                    body {
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        height: 100vh;
+                        margin: 0;
+                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    }
+                    .container {
+                        text-align: center;
+                        background: white;
+                        padding: 3rem;
+                        border-radius: 1rem;
+                        box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                        max-width: 400px;
+                    }
+                    h1 {
+                        color: #10b981;
+                        margin-bottom: 1rem;
+                        font-size: 2rem;
+                    }
+                    p {
+                        color: #6b7280;
+                        margin-bottom: 1.5rem;
+                        font-size: 1.1rem;
+                    }
+                    .checkmark {
+                        font-size: 4rem;
+                        color: #10b981;
+                        margin-bottom: 1rem;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <div class="checkmark">✓</div>
+                    <h1>Authentication Successful!</h1>
+                    <p>You can close this window and return to the application.</p>
+                    <p style="font-size: 0.9rem; color: #9ca3af;">Server: """ + (server_name or "unknown") + """</p>
+                </div>
+                <script>
+                    // Notify parent window
+                    if (window.opener) {
+                        window.opener.postMessage({
+                            type: 'oauth-success',
+                            serverName: '""" + (server_name or "unknown") + """'
+                        }, window.location.origin);
+                    }
+                    // Auto-close after 3 seconds
+                    setTimeout(() => window.close(), 3000);
+                </script>
+            </body>
+            </html>
+            """
+
+    except Exception as e:
+        logger.error("OAuth callback failed: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"OAuth callback failed: {str(e)}"
+        ) from e
 
 
 @router.get("/servers")
